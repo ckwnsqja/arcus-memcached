@@ -61,6 +61,7 @@
 #define TK_MAX_VAL_LEN 250
 
 /* Update the correct stat for a given operation */
+
 #define TK(tk, op, key, nkey, ctime) { \
     if (tk) { \
         assert(key); \
@@ -73,14 +74,21 @@
     } \
 }
 
+
 typedef struct dlist {
-    struct dlist *next;
-    struct dlist *prev;
+    struct dlist *next;//head
+    struct dlist *prev;//tail
 } dlist_t;
 
 typedef struct topkey_item {
     dlist_t list; /* Must be at the beginning because we downcast! */
     int nkey;
+#ifdef HOT_ITEMS
+    int counter;
+#ifdef SSL
+    int error_value;
+#endif
+#endif
     rel_time_t ctime, atime; /* Time this item was created/last accessed */
 #define TK_CUR(name) int name;
     TK_OPS(TK_CUR)
@@ -103,12 +111,32 @@ typedef struct topkey_item {
     char key[]; /* A variable length array in the struct itself */
 } topkey_item_t;
 
+#ifdef CSM
+#define CSM_D 5
+#define CSM_W 1024
+
+typedef struct count_sketch {
+    int cm[CSM_D][CSM_W];
+    int hash[CSM_D];
+}csm_t;
+#endif
+
 typedef struct topkeys {
     dlist_t list;
     pthread_mutex_t mutex;
     genhash_t *hash;
-    int nkeys;
-    int max_keys;
+#ifdef HOT_ITEMS
+    int N;//current number of keys
+    float op_time;
+#ifdef LC
+    int delta;
+#endif
+#ifdef CSM
+    csm_t *csm; 
+#endif
+#endif
+    int nkeys;//current number of hot list
+    int max_keys;//Max number of hot list
 } topkeys_t;
 
 topkeys_t *topkeys_init(int max_keys);

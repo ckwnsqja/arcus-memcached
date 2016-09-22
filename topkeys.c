@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/time.h>
 #include <memcached/genhash.h>
 #include "topkeys.h"
 
@@ -15,7 +16,7 @@ static topkey_item_t *topkey_item_init(const void *key, int nkey, rel_time_t cti
     item->nkey = nkey;
     item->ctime = ctime;
     item->atime = ctime;
-    /* Copy the key into the part trailing the struct */
+    // * Copy the key into the part trailing the struct * /
     memcpy(item->key, key, nkey);
     return item;
 }
@@ -33,6 +34,21 @@ static int my_hash_eq(const void *k1, size_t nkey1,
     return nkey1 == nkey2 && memcmp(k1, k2, nkey1) == 0;
 }
 
+#ifdef CSM
+static csm_t *csm_init() {
+    csm_t *csm = calloc(sizeof(csm_t),1);
+
+    if (csm != NULL) {
+        int i;
+        for (i = 0; i < CSM_D; i++) {
+            csm->hash[i] = 323 << (i + 1);
+        }
+    }
+
+    return csm;
+}
+#endif
+
 topkeys_t *topkeys_init(int max_keys) {
     topkeys_t *tk = calloc(sizeof(topkeys_t), 1);
     if (tk == NULL) {
@@ -43,7 +59,6 @@ topkeys_t *topkeys_init(int max_keys) {
     tk->max_keys = max_keys;
     tk->list.next = &tk->list;
     tk->list.prev = &tk->list;
-
     static struct hash_ops my_hash_ops = {
         .hashfunc = genhash_string_hash,
         .hasheq = my_hash_eq,
@@ -52,11 +67,17 @@ topkeys_t *topkeys_init(int max_keys) {
         .freeKey = NULL,
         .freeValue = NULL,
     };
-
+#ifdef CSM
+    tk->csm = csm_init();
+    if (tk->csm == NULL) {
+        return NULL;
+    }
+#endif
     tk->hash = genhash_init(max_keys, my_hash_ops);
     if (tk->hash == NULL) {
         return NULL;
     }
+    printf("max_keys : %d\n",max_keys);
     return tk;
 }
 
@@ -98,11 +119,221 @@ static inline void dlist_iter(dlist_t *list,
 static inline void topkeys_item_delete(topkeys_t *tk, topkey_item_t *item) {
     genhash_delete(tk->hash, item->key, item->nkey);
     dlist_remove(&item->list);
+#ifndef LC
     --tk->nkeys;
+#endif
     free(item);
 }
 
+#ifdef HOT_ITEMS
+static void print_out_list(topkeys_t *tk) {
+    dlist_t *p = &tk->list;
+    printf("HOT ITEMS LIST\n");
+
+    while ((p = p->next) != &tk->list) {
+        printf("%s : %d\n", ((topkey_item_t *)p)->key, ((topkey_item_t *)p)->counter);
+    }
+    printf("END\n");
+}
+
+
+#ifdef LC
+static void *topkeys_lossy(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
+    topkey_item_t *item = genhash_find(tk->hash, key, nkey);
+    ++tk->N;
+    if (item == NULL) {
+        item = topkey_item_init(key, nkey, ctime);
+        item->counter = tk->delta + 1;
+        if (item != NULL) {
+            genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
+        } else {
+            return NULL;
+        }
+    } else {
+        ++item->counter;
+        dlist_remove(&item->list);
+        //count++ & dlist_remove
+    }
+
+    dlist_t *p = &tk->list;
+    while ((p = p->next) != &tk->list) {
+        if (((topkey_item_t *)p)->counter >= item->counter) {
+            break;
+        }
+    }
+    dlist_insert_after(p->prev, &item->list);
+
+    if (tk->delta != (++tk->nkeys) / (tk->max_keys)) {
+        tk->delta = (tk->nkeys) / (tk->max_keys);
+        p = &tk->list;
+        while ((p = tk->list.next) != &tk->list) {
+            if (((topkey_item_t*)p)->counter < tk->delta) {
+                topkeys_item_delete(tk, (topkey_item_t *)p);
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (tk->N == 100000){
+        print_out_list(tk);
+        printf("Total operating time is %f.\n", tk->op_time);
+    }
+    return item;
+}
+#endif
+
+#ifdef SSL
+static void *topkeys_space_saving(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
+    topkey_item_t *item = genhash_find(tk->hash, key, nkey);
+    ++tk->N;
+    if (item == NULL) {
+        item = topkey_item_init(key, nkey, ctime);
+        if (item != NULL) {
+            genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
+            
+            if(++tk->nkeys <= tk->max_keys) {
+                item->counter = 1;
+            } else {
+                dlist_t *p = tk->list.next;
+                item->error_value = ((topkey_item_t *)p)->counter;
+                item->counter = item->error_value + 1;
+                topkeys_item_delete(tk, (topkey_item_t *)p);
+            }
+        } else {
+            return NULL;
+        }
+    } else {
+        ++item->counter;
+        dlist_remove(&item->list);
+    }
+
+    dlist_t *p = &tk->list;
+    while ((p = p->next) != &tk->list) {
+        if (((topkey_item_t *)p)->counter >= item->counter)
+            break;
+    }
+    dlist_insert_after(p->prev, &item->list);
+
+    if (tk->N == 100000) {
+        print_out_list(tk);
+        printf("Total operating time is %f.\n",tk->op_time);
+    }
+    return item;
+}
+#endif
+
+#ifdef CSM
+static int genhash_string_hash_csm(const void* p, size_t nkey, int rv)
+{
+    int i = 0;
+    char *str = (char *)p;
+
+    for (i = 0; i < nkey; i++) {
+       rv = ((rv << 1) + rv) ^ str[i];
+    }
+
+    return rv;
+}
+
+static int add_count(topkeys_t *tk, const void *key, size_t nkey) {
+    int i;
+    int mask = CSM_W - 1;
+ 
+    for (i = 0; i < CSM_D; i++) {
+        int val =  genhash_string_hash_csm(key, nkey, tk->csm->hash[i]);
+        val &= mask;
+        tk->csm->cm[i][val] += 1;        
+    }    
+    return 0;
+}
+
+static int estimate_count(topkeys_t *tk, const void *key, size_t nkey) {
+    int min = 0x7fffffff;
+    int i;
+    int mask = CSM_W - 1;
+
+    for (i = 0; i < CSM_D; i++) {
+        int val = genhash_string_hash_csm(key, nkey, tk->csm->hash[i]);
+        val &= mask;
+        if (min > tk->csm->cm[i][val]) {
+            min = tk->csm->cm[i][val];
+        }
+    }     
+    return min;
+}
+
+static void *topkeys_count_sketch_min(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
+    topkey_item_t *item = genhash_find(tk->hash, key, nkey);
+    add_count(tk, key, nkey);
+    ++tk->N;
+
+    if (tk->N == 100000){
+        print_out_list(tk);
+        printf("Total operating time is %f.\n", tk->op_time);
+    }
+
+    if (item == NULL) {
+        item = topkey_item_init(key, nkey, ctime);
+        if (item != NULL) {
+            if (++tk->nkeys < tk->max_keys) {
+                genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
+                item->counter = estimate_count(tk, key, nkey);
+            } else {
+                dlist_t *del = tk->list.next;
+
+                if (((topkey_item_t *)del)->counter < item->counter) {
+                    genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
+                    item->counter = estimate_count(tk, key, nkey);
+                    topkeys_item_delete(tk, (topkey_item_t *)del);
+                } else {
+                    free(item);
+                    --tk->nkeys;
+                    return del;
+                }
+            }
+        } else {
+            return NULL;
+        }
+    } else {
+        ++item->counter;
+        dlist_remove(&item->list);
+    }
+
+    dlist_t *p = &tk->list;
+    while ((p = p->next) != &tk->list) {
+        if (((topkey_item_t *)p)->counter >= item->counter) {
+            break;
+        }
+    }
+    dlist_insert_after(p->prev, &item->list);
+    return item;
+}
+#endif
+#endif
+
 topkey_item_t *topkeys_item_get_or_create(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
+#ifdef HOT_ITEMS
+    topkey_item_t *ret;
+    struct timeval start_point, end_point;
+    double operating_time;
+    gettimeofday(&start_point, NULL);
+
+#ifdef LC
+    ret = (topkey_item_t *)topkeys_lossy(tk, key, nkey, ctime);
+#endif
+#ifdef SSL
+    ret = (topkey_item_t *)topkeys_space_saving(tk, key, nkey, ctime);
+#endif
+#ifdef CSM
+    ret = (topkey_item_t *)topkeys_count_sketch_min(tk, key, nkey, ctime);
+#endif
+
+    gettimeofday(&end_point, NULL);
+    operating_time = (double)(end_point.tv_sec) + (double)(end_point.tv_usec) / 1000000.0 - (double)(start_point.tv_sec) - (double)(start_point.tv_usec) / 1000000.0;
+    tk->op_time += operating_time;
+    return ret;
+#else
     topkey_item_t *item = genhash_find(tk->hash, key, nkey);
     if (item == NULL) {
         item = topkey_item_init(key, nkey, ctime);
@@ -120,7 +351,9 @@ topkey_item_t *topkeys_item_get_or_create(topkeys_t *tk, const void *key, size_t
     }
     dlist_insert_after(&tk->list, &item->list);
     return item;
+#endif
 }
+
 
 /**** unused function ****
 static inline void append_stat(const void *cookie,

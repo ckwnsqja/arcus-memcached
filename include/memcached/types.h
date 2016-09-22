@@ -31,6 +31,10 @@ struct iovec {
 #include <sys/uio.h>
 #endif
 
+//#define LC
+//#define SSL
+#define CSM
+#define HOT_ITEMS
 #define CONFIG_API
 #define MAP_COLLECTION_SUPPORT
 #define SUPPORT_BOP_MGET
