@@ -80,11 +80,21 @@ typedef struct dlist {
     struct dlist *prev;//tail
 } dlist_t;
 
+#ifdef HOT_ITEMS
+typedef struct bucket {
+    struct bucket *next;
+    struct bucket *prev;
+    dlist_t list;
+    int score;
+} bucket_t;
+#endif
+
 typedef struct topkey_item {
     dlist_t list; /* Must be at the beginning because we downcast! */
     int nkey;
 #ifdef HOT_ITEMS
     int counter;
+    void *bucket;
 #ifdef SSL
     int error_value;
 #endif
@@ -126,6 +136,7 @@ typedef struct topkeys {
     pthread_mutex_t mutex;
     genhash_t *hash;
 #ifdef HOT_ITEMS
+    bucket_t bucket_list;
     int N;//current number of keys
     float op_time;
 #ifdef LC

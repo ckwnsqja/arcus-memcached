@@ -57,6 +57,10 @@ topkeys_t *topkeys_init(int max_keys) {
 
     pthread_mutex_init(&tk->mutex, NULL);
     tk->max_keys = max_keys;
+#ifdef HOT_ITEMS
+    tk->bucket_list.next = &tk->bucket_list;
+    tk->bucket_list.prev = &tk->bucket_list;
+#endif
     tk->list.next = &tk->list;
     tk->list.prev = &tk->list;
     static struct hash_ops my_hash_ops = {
@@ -126,21 +130,69 @@ static inline void topkeys_item_delete(topkeys_t *tk, topkey_item_t *item) {
 }
 
 #ifdef HOT_ITEMS
-static void print_out_list(topkeys_t *tk) {
-    dlist_t *p = &tk->list;
-    printf("HOT ITEMS LIST\n");
+static inline void bucket_remove(bucket_t *bk) {
+    assert(bk->prev->next == bk);
+    assert(bk->next->prev == bk);
+    bk->prev->next = bk->next;
+    bk->next->prev = bk->prev;
+}
 
+static inline void bucket_insert_after(bucket_t *bk, bucket_t *new) {
+    new->next = bk->next;
+    new->prev = bk;
+    bk->next->prev = new;
+    bk->next = new;
+}
+
+static bucket_t *bucket_init() {
+    bucket_t *bk = calloc(sizeof(bucket_t),1);
+    assert(bk);
+    bk->list.next = &bk->list;
+    bk->list.prev = &bk->list;
+    return bk;
+}
+
+static inline void insert_in_bucket(bucket_t *bk, dlist_t *new) {
+    dlist_insert_after(&bk->list, new);
+}
+
+static bool is_bucket_empty(bucket_t *bk) {
+    if((bk != NULL) && (&bk->list == bk->list.next)) {
+        return true;
+    }
+    return false;
+}
+
+static void iter_bucket_list(bucket_t *bk) {
+    dlist_t *p = &bk->list;
+    while((p = p->next) != &bk->list) {
+        printf("%s : %d\n", ((topkey_item_t *)p)->key, ((topkey_item_t *)p)->counter);
+    }
+}
+
+static void print_out_list(topkeys_t *tk) {
+  /*  dlist_t *p = &tk->list;
+    printf("HOT ITEMS LIST\n");
     while ((p = p->next) != &tk->list) {
         printf("%s : %d\n", ((topkey_item_t *)p)->key, ((topkey_item_t *)p)->counter);
+    }
+    printf("END\n");*/
+
+    bucket_t *p = &tk->bucket_list;
+    printf("HOT ITEMS LIST\n");
+    while ((p = p->next) != &tk->bucket_list) {
+        iter_bucket_list(p);
     }
     printf("END\n");
 }
 
-
 #ifdef LC
 static void *topkeys_lossy(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
     topkey_item_t *item = genhash_find(tk->hash, key, nkey);
-    ++tk->N;
+    bucket_t *bk = &tk->bucket_list;
+    bucket_t *del = NULL;
+    bool new_bucket = true;
+
     if (item == NULL) {
         item = topkey_item_init(key, nkey, ctime);
         item->counter = tk->delta + 1;
@@ -151,24 +203,47 @@ static void *topkeys_lossy(topkeys_t *tk, const void *key, size_t nkey, const re
         }
     } else {
         ++item->counter;
+        bk = (bucket_t *)(item->bucket);
         dlist_remove(&item->list);
+        del = bk;
         //count++ & dlist_remove
     }
 
-    dlist_t *p = &tk->list;
-    while ((p = p->next) != &tk->list) {
-        if (((topkey_item_t *)p)->counter >= item->counter) {
+    while ((bk = bk->next) != &tk->bucket_list) {
+        if (bk->score == item->counter) {
+            insert_in_bucket(bk, &item->list);
+            item->bucket = bk;
+            new_bucket = false;
+        } else if (bk->score > item->counter) {
             break;
         }
     }
-    dlist_insert_after(p->prev, &item->list);
 
-    if (tk->delta != (++tk->nkeys) / (tk->max_keys)) {
-        tk->delta = (tk->nkeys) / (tk->max_keys);
-        p = &tk->list;
-        while ((p = tk->list.next) != &tk->list) {
-            if (((topkey_item_t*)p)->counter < tk->delta) {
-                topkeys_item_delete(tk, (topkey_item_t *)p);
+    if (new_bucket) {
+        bucket_t *new_bk = bucket_init();
+
+        new_bk->score = item->counter;
+        item->bucket = new_bk;
+
+        insert_in_bucket(new_bk, &item->list);
+        bucket_insert_after(bk->prev, new_bk);
+    }
+
+    if (is_bucket_empty(del)) {
+        bucket_remove(del);
+        free(del);
+    }
+
+    if (tk->delta != (++tk->nkeys) / (tk->max_keys * 2)) {
+        tk->delta = (tk->nkeys) / (tk->max_keys * 2);
+        while ((bk = tk->bucket_list.next) != &tk->bucket_list) {
+            if (bk->score < tk->delta) {
+                dlist_t *p = NULL;
+                while((p = bk->list.next) != &bk->list) {
+                    topkeys_item_delete(tk, (topkey_item_t *)p);
+                }
+                bucket_remove(bk);
+                free(bk);
             } else {
                 break;
             }
@@ -186,39 +261,64 @@ static void *topkeys_lossy(topkeys_t *tk, const void *key, size_t nkey, const re
 #ifdef SSL
 static void *topkeys_space_saving(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
     topkey_item_t *item = genhash_find(tk->hash, key, nkey);
-    ++tk->N;
+    bucket_t *bk = &tk->bucket_list;
+    bucket_t *del = NULL;
+    bool new_bucket = true;
+
     if (item == NULL) {
         item = topkey_item_init(key, nkey, ctime);
         if (item != NULL) {
-            genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
-            
+            genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));           
             if(++tk->nkeys <= tk->max_keys) {
                 item->counter = 1;
             } else {
-                dlist_t *p = tk->list.next;
+                dlist_t *p = tk->bucket_list.next->list.next;
                 item->error_value = ((topkey_item_t *)p)->counter;
                 item->counter = item->error_value + 1;
+                del = (bucket_t *)((topkey_item_t *)p)->bucket;
+
                 topkeys_item_delete(tk, (topkey_item_t *)p);
             }
         } else {
             return NULL;
         }
     } else {
-        ++item->counter;
+        ++item->counter;    
+        bk = (bucket_t *)(item->bucket);
         dlist_remove(&item->list);
+        del = bk;
     }
 
-    dlist_t *p = &tk->list;
-    while ((p = p->next) != &tk->list) {
-        if (((topkey_item_t *)p)->counter >= item->counter)
+    while ((bk = bk->next) != &tk->bucket_list) {
+        if (bk->score == item->counter) {
+            insert_in_bucket(bk, &item->list);
+            item->bucket = bk;
+            new_bucket = false;
+        } else if (bk->score > item->counter) {
             break;
+        }
     }
-    dlist_insert_after(p->prev, &item->list);
+
+    if (new_bucket) {
+        bucket_t *new_bk = bucket_init();
+
+        new_bk->score = item->counter;
+        item->bucket = new_bk;
+
+        insert_in_bucket(new_bk, &item->list);
+        bucket_insert_after(bk->prev, new_bk);
+    }
+
+    if (is_bucket_empty(del)) {
+        bucket_remove(del);
+        free(del);
+    }
 
     if (tk->N == 100000) {
         print_out_list(tk);
         printf("Total operating time is %f.\n",tk->op_time);
     }
+
     return item;
 }
 #endif
@@ -267,29 +367,31 @@ static void *topkeys_count_sketch_min(topkeys_t *tk, const void *key, size_t nke
     topkey_item_t *item = genhash_find(tk->hash, key, nkey);
     add_count(tk, key, nkey);
     ++tk->N;
+    bucket_t *bk = &tk->bucket_list;
+    bucket_t *del = NULL;
+    bool new_bucket = true;
 
-    if (tk->N == 100000){
+   if (tk->N == 100000){
         print_out_list(tk);
-        printf("Total operating time is %f.\n", tk->op_time);
-    }
+        printf("Total operating time is %f.\n",tk->op_time);
+   }
 
     if (item == NULL) {
         item = topkey_item_init(key, nkey, ctime);
         if (item != NULL) {
+            item->counter = estimate_count(tk, key, nkey);
             if (++tk->nkeys < tk->max_keys) {
                 genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
-                item->counter = estimate_count(tk, key, nkey);
             } else {
-                dlist_t *del = tk->list.next;
-
-                if (((topkey_item_t *)del)->counter < item->counter) {
+                dlist_t *p = tk->bucket_list.next->list.next;
+                if (((topkey_item_t *)p)->counter < item->counter) {
                     genhash_update(tk->hash, item->key, item->nkey, item, topkey_item_size(item));
-                    item->counter = estimate_count(tk, key, nkey);
-                    topkeys_item_delete(tk, (topkey_item_t *)del);
+                    del = (bucket_t *)((topkey_item_t *)p)->bucket;
+                    topkeys_item_delete(tk, (topkey_item_t *)p);
                 } else {
                     free(item);
                     --tk->nkeys;
-                    return del;
+                    return p;
                 }
             }
         } else {
@@ -297,16 +399,36 @@ static void *topkeys_count_sketch_min(topkeys_t *tk, const void *key, size_t nke
         }
     } else {
         ++item->counter;
+        bk = (bucket_t *)(item->bucket);
         dlist_remove(&item->list);
+        del = bk;
     }
 
-    dlist_t *p = &tk->list;
-    while ((p = p->next) != &tk->list) {
-        if (((topkey_item_t *)p)->counter >= item->counter) {
+    while ((bk = bk->next) != &tk->bucket_list) {
+        if (bk->score == item->counter) {
+            insert_in_bucket(bk, &item->list);
+            item->bucket = bk;
+            new_bucket = false;
+        } else if (bk->score > item->counter) {
             break;
         }
     }
-    dlist_insert_after(p->prev, &item->list);
+
+    if (new_bucket) {
+        bucket_t *new_bk = bucket_init();
+
+        new_bk->score = item->counter;
+        item->bucket = new_bk;
+
+        insert_in_bucket(new_bk, &item->list);
+        bucket_insert_after(bk->prev, new_bk);
+    }
+
+    if (is_bucket_empty(del)) {
+        bucket_remove(del);
+        free(del);
+    }
+
     return item;
 }
 #endif
@@ -315,10 +437,10 @@ static void *topkeys_count_sketch_min(topkeys_t *tk, const void *key, size_t nke
 topkey_item_t *topkeys_item_get_or_create(topkeys_t *tk, const void *key, size_t nkey, const rel_time_t ctime) {
 #ifdef HOT_ITEMS
     topkey_item_t *ret;
-    struct timeval start_point, end_point;
+/*    struct timeval start_point, end_point;
     double operating_time;
     gettimeofday(&start_point, NULL);
-
+*/
 #ifdef LC
     ret = (topkey_item_t *)topkeys_lossy(tk, key, nkey, ctime);
 #endif
@@ -329,9 +451,9 @@ topkey_item_t *topkeys_item_get_or_create(topkeys_t *tk, const void *key, size_t
     ret = (topkey_item_t *)topkeys_count_sketch_min(tk, key, nkey, ctime);
 #endif
 
-    gettimeofday(&end_point, NULL);
+/*    gettimeofday(&end_point, NULL);
     operating_time = (double)(end_point.tv_sec) + (double)(end_point.tv_usec) / 1000000.0 - (double)(start_point.tv_sec) - (double)(start_point.tv_usec) / 1000000.0;
-    tk->op_time += operating_time;
+    tk->op_time += operating_time;*/
     return ret;
 #else
     topkey_item_t *item = genhash_find(tk->hash, key, nkey);
